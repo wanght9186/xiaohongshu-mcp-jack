@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
+	"os"
 
 	"github.com/go-rod/rod"
 	"github.com/sirupsen/logrus"
@@ -21,10 +24,10 @@ func main() {
 
 	// 登录的时候，需要界面，所以不能无头模式
 	b := browser.NewBrowser(false, browser.WithBinPath(binPath))
-	defer b.Close()
+	// 不自动关闭浏览器，让用户可以在登录后继续操作
 
 	page := b.NewPage()
-	defer page.Close()
+	// 不自动关闭页面，保持浏览器打开
 
 	action := xiaohongshu.NewLogin(page)
 
@@ -36,6 +39,19 @@ func main() {
 	logrus.Infof("当前登录状态: %v", status)
 
 	if status {
+		logrus.Info("您已经登录，浏览器将保持打开以便您继续操作。")
+		// 保持浏览器打开，等待用户按回车键后退出
+		fmt.Println("\n========================================")
+		fmt.Println("浏览器窗口将保持打开，您可以继续操作。")
+		fmt.Println("操作完成后，按回车键退出程序并关闭浏览器。")
+		fmt.Println("========================================")
+		
+		reader := bufio.NewReader(os.Stdin)
+		_, _ = reader.ReadString('\n')
+		
+		// 用户按回车后，清理资源
+		page.Close()
+		b.Close()
 		return
 	}
 
@@ -61,6 +77,18 @@ func main() {
 		logrus.Error("登录流程完成但仍未登录")
 	}
 
+	// 保持浏览器打开，等待用户按回车键后退出
+	fmt.Println("\n========================================")
+	fmt.Println("浏览器窗口将保持打开，您可以继续操作。")
+	fmt.Println("操作完成后，按回车键退出程序并关闭浏览器。")
+	fmt.Println("========================================")
+	
+	reader := bufio.NewReader(os.Stdin)
+	_, _ = reader.ReadString('\n')
+	
+	// 用户按回车后，清理资源
+	page.Close()
+	b.Close()
 }
 
 func saveCookies(page *rod.Page) error {
