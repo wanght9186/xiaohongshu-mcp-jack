@@ -17,31 +17,31 @@ func NewLogin(page *rod.Page) *LoginAction {
 }
 
 func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
-	pp := a.page.Context(ctx)
-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
-
-	time.Sleep(1 * time.Second)
+	pp := a.page.Context(ctx).Timeout(20 * time.Second)
+	if err := pp.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
+		return false, errors.Wrap(err, "navigate explore failed")
+	}
+	// Don't wait for full "load" event; it can hang on heavy third-party assets.
+	time.Sleep(2 * time.Second)
 
 	exists, _, err := pp.Has(`.main-container .user .link-wrapper .channel`)
 	if err != nil {
 		return false, errors.Wrap(err, "check login status failed")
 	}
 
-	if !exists {
-		return false, errors.Wrap(err, "login status element not found")
-	}
-
-	return true, nil
+	// 未找到登录元素表示未登录，不应作为错误返回。
+	return exists, nil
 }
 
 func (a *LoginAction) Login(ctx context.Context) error {
-	pp := a.page.Context(ctx)
+	pp := a.page.Context(ctx).Timeout(10 * time.Minute)
 
 	// 导航到小红书首页，这会触发二维码弹窗
-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
-
-	// 等待一小段时间让页面完全加载
-	time.Sleep(2 * time.Second)
+	if err := pp.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
+		return errors.Wrap(err, "navigate explore failed")
+	}
+	// 等待一小段时间让页面关键元素加载
+	time.Sleep(3 * time.Second)
 
 	// 检查是否已经登录
 	if exists, _, _ := pp.Has(".main-container .user .link-wrapper .channel"); exists {
@@ -51,19 +51,22 @@ func (a *LoginAction) Login(ctx context.Context) error {
 
 	// 等待扫码成功提示或者登录完成
 	// 这里我们等待登录成功的元素出现，这样更简单可靠
-	pp.MustElement(".main-container .user .link-wrapper .channel")
+	if _, err := pp.Element(".main-container .user .link-wrapper .channel"); err != nil {
+		return errors.Wrap(err, "wait login success element failed")
+	}
 
 	return nil
 }
 
 func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error) {
-	pp := a.page.Context(ctx)
+	pp := a.page.Context(ctx).Timeout(40 * time.Second)
 
 	// 导航到小红书首页，这会触发二维码弹窗
-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
-
-	// 等待一小段时间让页面完全加载
-	time.Sleep(2 * time.Second)
+	if err := pp.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
+		return "", false, errors.Wrap(err, "navigate explore failed")
+	}
+	// 等待一小段时间让页面关键元素加载
+	time.Sleep(3 * time.Second)
 
 	// 检查是否已经登录
 	if exists, _, _ := pp.Has(".main-container .user .link-wrapper .channel"); exists {
@@ -71,7 +74,12 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	}
 
 	// 获取二维码图片
-	src, err := pp.MustElement(".login-container .qrcode-img").Attribute("src")
+	qrEl, err := pp.Element(".login-container .qrcode-img")
+	if err != nil {
+		return "", false, errors.Wrap(err, "find qrcode element failed")
+	}
+
+	src, err := qrEl.Attribute("src")
 	if err != nil {
 		return "", false, errors.Wrap(err, "get qrcode src failed")
 	}

@@ -3,23 +3,31 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/go-rod/rod"
-	"github.com/mattn/go-runewidth"
 	"github.com/sirupsen/logrus"
 	"github.com/xpzouying/headless_browser"
 	"github.com/xpzouying/xiaohongshu-mcp/browser"
 	"github.com/xpzouying/xiaohongshu-mcp/configs"
 	"github.com/xpzouying/xiaohongshu-mcp/cookies"
 	"github.com/xpzouying/xiaohongshu-mcp/pkg/downloader"
+	"github.com/xpzouying/xiaohongshu-mcp/pkg/xhsutil"
 	"github.com/xpzouying/xiaohongshu-mcp/xiaohongshu"
 )
 
 // XiaohongshuService 小红书业务服务
 type XiaohongshuService struct{}
+
+const (
+	defaultBrowserOperationTimeout = 50 * time.Second
+	shortBrowserOperationTimeout   = 45 * time.Second
+)
+
+var browserSlots = make(chan struct{}, 1)
 
 // NewXiaohongshuService 创建小红书服务实例
 func NewXiaohongshuService() *XiaohongshuService {
@@ -28,10 +36,11 @@ func NewXiaohongshuService() *XiaohongshuService {
 
 // PublishRequest 发布请求
 type PublishRequest struct {
-	Title   string   `json:"title" binding:"required"`
-	Content string   `json:"content" binding:"required"`
-	Images  []string `json:"images" binding:"required,min=1"`
-	Tags    []string `json:"tags,omitempty"`
+	Title      string   `json:"title" binding:"required"`
+	Content    string   `json:"content" binding:"required"`
+	Images     []string `json:"images" binding:"required,min=1"`
+	Tags       []string `json:"tags,omitempty"`
+	ScheduleAt string   `json:"schedule_at,omitempty"` // 定时发布时间，ISO8601格式，为空则立即发布
 }
 
 // LoginStatusResponse 登录状态响应
@@ -58,10 +67,11 @@ type PublishResponse struct {
 
 // PublishVideoRequest 发布视频请求（仅支持本地单个视频文件）
 type PublishVideoRequest struct {
-	Title   string   `json:"title" binding:"required"`
-	Content string   `json:"content" binding:"required"`
-	Video   string   `json:"video" binding:"required"`
-	Tags    []string `json:"tags,omitempty"`
+	Title      string   `json:"title" binding:"required"`
+	Content    string   `json:"content" binding:"required"`
+	Video      string   `json:"video" binding:"required"`
+	Tags       []string `json:"tags,omitempty"`
+	ScheduleAt string   `json:"schedule_at,omitempty"` // 定时发布时间，ISO8601格式，为空则立即发布
 }
 
 // PublishVideoResponse 发布视频响应
@@ -95,17 +105,18 @@ func (s *XiaohongshuService) DeleteCookies(ctx context.Context) error {
 
 // CheckLoginStatus 检查登录状态
 func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatusResponse, error) {
-	b := newBrowser()
-	defer b.Close()
+	var isLoggedIn bool
+	err := withBrowserPageContext(ctx, "check_login_status", shortBrowserOperationTimeout, func(opCtx context.Context, page *rod.Page) error {
+		loginAction := xiaohongshu.NewLogin(page)
 
-	page := b.NewPage()
-	defer page.Close()
-
-	loginAction := xiaohongshu.NewLogin(page)
-
-	isLoggedIn, err := loginAction.CheckLoginStatus(ctx)
+		var checkErr error
+		isLoggedIn, checkErr = loginAction.CheckLoginStatus(opCtx)
+		return checkErr
+	})
 	if err != nil {
-		return nil, err
+		// 登录检查不应导致整体 MCP 工作流失败，异常时降级为“未登录”。
+		logrus.Warnf("检查登录状态失败，降级返回未登录: %v", err)
+		isLoggedIn = false
 	}
 
 	response := &LoginStatusResponse{
@@ -166,10 +177,8 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 
 // PublishContent 发布内容
 func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishRequest) (*PublishResponse, error) {
-	// 验证标题长度
-	// 小红书限制：最大40个单位长度
-	// 中文/日文/韩文占2个单位，英文/数字占1个单位
-	if titleWidth := runewidth.StringWidth(req.Title); titleWidth > 40 {
+	// 验证标题长度（小红书限制：最大20个字）
+	if xhsutil.CalcTitleLength(req.Title) > 20 {
 		return nil, fmt.Errorf("标题长度超过限制")
 	}
 
@@ -179,12 +188,39 @@ func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishReq
 		return nil, err
 	}
 
+	// 解析定时发布时间
+	var scheduleTime *time.Time
+	if req.ScheduleAt != "" {
+		t, err := time.Parse(time.RFC3339, req.ScheduleAt)
+		if err != nil {
+			return nil, fmt.Errorf("定时发布时间格式错误，请使用 ISO8601 格式: %v", err)
+		}
+
+		// 校验定时发布时间范围：1小时至14天
+		now := time.Now()
+		minTime := now.Add(1 * time.Hour)
+		maxTime := now.Add(14 * 24 * time.Hour)
+
+		if t.Before(minTime) {
+			return nil, fmt.Errorf("定时发布时间必须至少在1小时后，当前设置: %s，最早可选: %s",
+				t.Format("2006-01-02 15:04"), minTime.Format("2006-01-02 15:04"))
+		}
+		if t.After(maxTime) {
+			return nil, fmt.Errorf("定时发布时间不能超过14天，当前设置: %s，最晚可选: %s",
+				t.Format("2006-01-02 15:04"), maxTime.Format("2006-01-02 15:04"))
+		}
+
+		scheduleTime = &t
+		logrus.Infof("设置定时发布时间: %s", t.Format("2006-01-02 15:04"))
+	}
+
 	// 构建发布内容
 	content := xiaohongshu.PublishImageContent{
-		Title:      req.Title,
-		Content:    req.Content,
-		Tags:       req.Tags,
-		ImagePaths: imagePaths,
+		Title:        req.Title,
+		Content:      req.Content,
+		Tags:         req.Tags,
+		ImagePaths:   imagePaths,
+		ScheduleTime: scheduleTime,
 	}
 
 	// 执行发布
@@ -228,8 +264,8 @@ func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohon
 
 // PublishVideo 发布视频（本地文件）
 func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideoRequest) (*PublishVideoResponse, error) {
-	// 标题长度校验
-	if titleWidth := runewidth.StringWidth(req.Title); titleWidth > 40 {
+	// 标题长度校验（小红书限制：最大20个字）
+	if xhsutil.CalcTitleLength(req.Title) > 20 {
 		return nil, fmt.Errorf("标题长度超过限制")
 	}
 
@@ -241,12 +277,39 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 		return nil, fmt.Errorf("视频文件不存在或不可访问: %v", err)
 	}
 
+	// 解析定时发布时间
+	var scheduleTime *time.Time
+	if req.ScheduleAt != "" {
+		t, err := time.Parse(time.RFC3339, req.ScheduleAt)
+		if err != nil {
+			return nil, fmt.Errorf("定时发布时间格式错误，请使用 ISO8601 格式: %v", err)
+		}
+
+		// 校验定时发布时间范围：1小时至14天
+		now := time.Now()
+		minTime := now.Add(1 * time.Hour)
+		maxTime := now.Add(14 * 24 * time.Hour)
+
+		if t.Before(minTime) {
+			return nil, fmt.Errorf("定时发布时间必须至少在1小时后，当前设置: %s，最早可选: %s",
+				t.Format("2006-01-02 15:04"), minTime.Format("2006-01-02 15:04"))
+		}
+		if t.After(maxTime) {
+			return nil, fmt.Errorf("定时发布时间不能超过14天，当前设置: %s，最晚可选: %s",
+				t.Format("2006-01-02 15:04"), maxTime.Format("2006-01-02 15:04"))
+		}
+
+		scheduleTime = &t
+		logrus.Infof("设置定时发布时间: %s", t.Format("2006-01-02 15:04"))
+	}
+
 	// 构建发布内容
 	content := xiaohongshu.PublishVideoContent{
-		Title:     req.Title,
-		Content:   req.Content,
-		Tags:      req.Tags,
-		VideoPath: req.Video,
+		Title:        req.Title,
+		Content:      req.Content,
+		Tags:         req.Tags,
+		VideoPath:    req.Video,
+		ScheduleTime: scheduleTime,
 	}
 
 	// 执行发布
@@ -281,17 +344,13 @@ func (s *XiaohongshuService) publishVideo(ctx context.Context, content xiaohongs
 
 // ListFeeds 获取Feeds列表
 func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse, error) {
-	b := newBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	// 创建 Feeds 列表 action
-	action := xiaohongshu.NewFeedsListAction(page)
-
-	// 获取 Feeds 列表
-	feeds, err := action.GetFeedsList(ctx)
+	var feeds []xiaohongshu.Feed
+	err := withBrowserPageContext(ctx, "list_feeds", defaultBrowserOperationTimeout, func(opCtx context.Context, page *rod.Page) error {
+		action := xiaohongshu.NewFeedsListAction(page)
+		var actionErr error
+		feeds, actionErr = action.GetFeedsList(opCtx)
+		return actionErr
+	})
 	if err != nil {
 		logrus.Errorf("获取 Feeds 列表失败: %v", err)
 		return nil, err
@@ -306,15 +365,13 @@ func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse,
 }
 
 func (s *XiaohongshuService) SearchFeeds(ctx context.Context, keyword string, filters ...xiaohongshu.FilterOption) (*FeedsListResponse, error) {
-	b := newBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	action := xiaohongshu.NewSearchAction(page)
-
-	feeds, err := action.Search(ctx, keyword, filters...)
+	var feeds []xiaohongshu.Feed
+	err := withBrowserPageContext(ctx, "search_feeds", defaultBrowserOperationTimeout, func(opCtx context.Context, page *rod.Page) error {
+		action := xiaohongshu.NewSearchAction(page)
+		var actionErr error
+		feeds, actionErr = action.Search(opCtx, keyword, filters...)
+		return actionErr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -334,17 +391,13 @@ func (s *XiaohongshuService) GetFeedDetail(ctx context.Context, feedID, xsecToke
 
 // GetFeedDetailWithConfig 使用配置获取Feed详情
 func (s *XiaohongshuService) GetFeedDetailWithConfig(ctx context.Context, feedID, xsecToken string, loadAllComments bool, config xiaohongshu.CommentLoadConfig) (*FeedDetailResponse, error) {
-	b := newBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	// 创建 Feed 详情 action
-	action := xiaohongshu.NewFeedDetailAction(page)
-
-	// 获取 Feed 详情
-	result, err := action.GetFeedDetailWithConfig(ctx, feedID, xsecToken, loadAllComments, config)
+	var result *xiaohongshu.FeedDetailResponse
+	err := withBrowserPageContext(ctx, "get_feed_detail", defaultBrowserOperationTimeout, func(opCtx context.Context, page *rod.Page) error {
+		action := xiaohongshu.NewFeedDetailAction(page)
+		var actionErr error
+		result, actionErr = action.GetFeedDetailWithConfig(opCtx, feedID, xsecToken, loadAllComments, config)
+		return actionErr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -359,15 +412,13 @@ func (s *XiaohongshuService) GetFeedDetailWithConfig(ctx context.Context, feedID
 
 // UserProfile 获取用户信息
 func (s *XiaohongshuService) UserProfile(ctx context.Context, userID, xsecToken string) (*UserProfileResponse, error) {
-	b := newBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	action := xiaohongshu.NewUserProfileAction(page)
-
-	result, err := action.UserProfile(ctx, userID, xsecToken)
+	var result *xiaohongshu.UserProfileResponse
+	err := withBrowserPageContext(ctx, "user_profile", defaultBrowserOperationTimeout, func(opCtx context.Context, page *rod.Page) error {
+		action := xiaohongshu.NewUserProfileAction(page)
+		var actionErr error
+		result, actionErr = action.UserProfile(opCtx, userID, xsecToken)
+		return actionErr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -500,6 +551,68 @@ func saveCookies(page *rod.Page) error {
 	return cookieLoader.SaveCookies(data)
 }
 
+func withBrowserPageContext(
+	ctx context.Context,
+	operation string,
+	timeout time.Duration,
+	fn func(context.Context, *rod.Page) error,
+) error {
+	opCtx, cancel := withDefaultTimeout(ctx, timeout)
+	defer cancel()
+
+	release, err := acquireBrowserSlot(opCtx, operation)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	b := newBrowser()
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	var opErr error
+	if panicErr := rod.Try(func() {
+		opErr = fn(opCtx, page)
+	}); panicErr != nil {
+		return fmt.Errorf("%s failed: %w", operation, normalizeBrowserError(panicErr))
+	}
+	if opErr != nil {
+		return fmt.Errorf("%s failed: %w", operation, opErr)
+	}
+	return nil
+}
+
+func withDefaultTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func acquireBrowserSlot(ctx context.Context, operation string) (func(), error) {
+	select {
+	case browserSlots <- struct{}{}:
+		return func() { <-browserSlots }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%s queue timeout: %w", operation, ctx.Err())
+	}
+}
+
+func normalizeBrowserError(err error) error {
+	var tryErr *rod.TryError
+	if errors.As(err, &tryErr) {
+		if unwrapped := errors.Unwrap(tryErr); unwrapped != nil {
+			return unwrapped
+		}
+	}
+	return err
+}
+
 // withBrowserPage 执行需要浏览器页面的操作的通用函数
 func withBrowserPage(fn func(*rod.Page) error) error {
 	b := newBrowser()
@@ -516,9 +629,9 @@ func (s *XiaohongshuService) GetMyProfile(ctx context.Context) (*UserProfileResp
 	var result *xiaohongshu.UserProfileResponse
 	var err error
 
-	err = withBrowserPage(func(page *rod.Page) error {
+	err = withBrowserPageContext(ctx, "get_my_profile", defaultBrowserOperationTimeout, func(opCtx context.Context, page *rod.Page) error {
 		action := xiaohongshu.NewUserProfileAction(page)
-		result, err = action.GetMyProfileViaSidebar(ctx)
+		result, err = action.GetMyProfileViaSidebar(opCtx)
 		return err
 	})
 

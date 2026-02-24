@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/sirupsen/logrus"
@@ -16,6 +17,14 @@ import (
 )
 
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			logrus.Errorf("登录工具发生异常: %v", r)
+			fmt.Println("登录工具发生异常，请重新运行。")
+			os.Exit(1)
+		}
+	}()
+
 	var (
 		binPath string // 浏览器二进制文件路径
 	)
@@ -31,24 +40,30 @@ func main() {
 
 	action := xiaohongshu.NewLogin(page)
 
-	status, err := action.CheckLoginStatus(context.Background())
+	checkCtx, cancelCheck := context.WithTimeout(context.Background(), 45*time.Second)
+	status, err := action.CheckLoginStatus(checkCtx)
+	cancelCheck()
 	if err != nil {
-		logrus.Fatalf("failed to check login status: %v", err)
+		logrus.Warnf("首次检查登录状态失败，将继续登录流程: %v", err)
+		status = false
 	}
 
 	logrus.Infof("当前登录状态: %v", status)
 
 	if status {
 		logrus.Info("您已经登录，浏览器将保持打开以便您继续操作。")
+		if err := saveCookies(page); err != nil {
+			logrus.Fatalf("failed to save cookies: %v", err)
+		}
 		// 保持浏览器打开，等待用户按回车键后退出
 		fmt.Println("\n========================================")
 		fmt.Println("浏览器窗口将保持打开，您可以继续操作。")
 		fmt.Println("操作完成后，按回车键退出程序并关闭浏览器。")
 		fmt.Println("========================================")
-		
+
 		reader := bufio.NewReader(os.Stdin)
 		_, _ = reader.ReadString('\n')
-		
+
 		// 用户按回车后，清理资源
 		page.Close()
 		b.Close()
@@ -57,24 +72,33 @@ func main() {
 
 	// 开始登录流程
 	logrus.Info("开始登录流程...")
-	if err = action.Login(context.Background()); err != nil {
+	loginCtx, cancelLogin := context.WithTimeout(context.Background(), 8*time.Minute)
+	if err = action.Login(loginCtx); err != nil {
+		cancelLogin()
 		logrus.Fatalf("登录失败: %v", err)
 	} else {
+		cancelLogin()
 		if err := saveCookies(page); err != nil {
 			logrus.Fatalf("failed to save cookies: %v", err)
 		}
 	}
 
 	// 再次检查登录状态确认成功
-	status, err = action.CheckLoginStatus(context.Background())
+	checkCtx2, cancelCheck2 := context.WithTimeout(context.Background(), 45*time.Second)
+	status, err = action.CheckLoginStatus(checkCtx2)
+	cancelCheck2()
+	verifiedAfterLogin := true
 	if err != nil {
-		logrus.Fatalf("failed to check login status after login: %v", err)
+		logrus.Warnf("登录后检查状态失败，请手动确认是否已登录: %v", err)
+		verifiedAfterLogin = false
 	}
 
-	if status {
+	if verifiedAfterLogin && status {
 		logrus.Info("登录成功！")
-	} else {
+	} else if verifiedAfterLogin {
 		logrus.Error("登录流程完成但仍未登录")
+	} else {
+		logrus.Warn("登录流程已完成，但无法自动验证登录状态，请在 MCP 中执行 check_login_status 再确认。")
 	}
 
 	// 保持浏览器打开，等待用户按回车键后退出
@@ -82,10 +106,10 @@ func main() {
 	fmt.Println("浏览器窗口将保持打开，您可以继续操作。")
 	fmt.Println("操作完成后，按回车键退出程序并关闭浏览器。")
 	fmt.Println("========================================")
-	
+
 	reader := bufio.NewReader(os.Stdin)
 	_, _ = reader.ReadString('\n')
-	
+
 	// 用户按回车后，清理资源
 	page.Close()
 	b.Close()

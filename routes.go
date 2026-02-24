@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -29,11 +30,13 @@ func setupRoutes(appServer *AppServer) *gin.Engine {
 			return appServer.mcpServer
 		},
 		&mcp.StreamableHTTPOptions{
+			Stateless:    true, // 兼容会话复用不稳定的 MCP 客户端
 			JSONResponse: true, // 支持 JSON 响应
 		},
 	)
-	router.Any("/mcp", gin.WrapH(mcpHandler))
-	router.Any("/mcp/*path", gin.WrapH(mcpHandler))
+	mcpCompatHandler := normalizeMCPAcceptHeader(mcpHandler)
+	router.Any("/mcp", gin.WrapH(mcpCompatHandler))
+	router.Any("/mcp/*path", gin.WrapH(mcpCompatHandler))
 
 	// API 路由组
 	api := router.Group("/api/v1")
@@ -54,4 +57,30 @@ func setupRoutes(appServer *AppServer) *gin.Engine {
 	}
 
 	return router
+}
+
+// normalizeMCPAcceptHeader adds a compatibility fallback for clients that only
+// send one media type in Accept when calling Streamable HTTP endpoints.
+func normalizeMCPAcceptHeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accept := strings.Split(strings.Join(r.Header.Values("Accept"), ","), ",")
+		var jsonOK, streamOK bool
+		for _, c := range accept {
+			switch strings.TrimSpace(c) {
+			case "application/json", "application/*":
+				jsonOK = true
+			case "text/event-stream", "text/*":
+				streamOK = true
+			case "*/*":
+				jsonOK = true
+				streamOK = true
+			}
+		}
+
+		if !jsonOK || !streamOK {
+			r.Header.Set("Accept", "application/json, text/event-stream")
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
